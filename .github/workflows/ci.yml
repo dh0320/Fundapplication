@@ -1,0 +1,136 @@
+name: GrantDraft CI
+
+on:
+  push:
+    branches: ["*"]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  # ─────────────────────────────────────
+  # 1) バックエンドのテスト
+  # ─────────────────────────────────────
+  api-test:
+    name: "API Tests"
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: grantdraft_test
+          POSTGRES_USER: grantdraft
+          POSTGRES_PASSWORD: grantdraft_dev
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U grantdraft"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r apps/api/requirements.txt
+
+      - name: Run Alembic migrations
+        working-directory: .
+        env:
+          DATABASE_URL: postgresql+asyncpg://grantdraft:grantdraft_dev@localhost:5432/grantdraft_test
+        run: |
+          PYTHONPATH=apps/api alembic -c alembic.ini upgrade head
+
+      - name: Run API tests
+        working-directory: apps/api
+        env:
+          DATABASE_URL: postgresql+asyncpg://grantdraft:grantdraft_dev@localhost:5432/grantdraft_test
+          TEST_DATABASE_URL: postgresql+asyncpg://grantdraft:grantdraft_dev@localhost:5432/grantdraft_test
+        run: |
+          python -m pytest tests/ -v --tb=short
+
+  # ─────────────────────────────────────
+  # 2) ワーカーのユニットテスト
+  # ─────────────────────────────────────
+  worker-test:
+    name: "Worker Tests"
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r apps/api/requirements.txt
+
+      - name: Run worker tests
+        env:
+          PYTHONPATH: apps/api
+        run: |
+          python -m pytest workers/scraper/tests/ -v --tb=short
+
+  # ─────────────────────────────────────
+  # 3) フロントエンドのビルドチェック
+  # ─────────────────────────────────────
+  web-build:
+    name: "Frontend Build"
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        working-directory: apps/web
+        run: npm install
+
+      - name: Type check & Build
+        working-directory: apps/web
+        env:
+          NEXT_PUBLIC_API_URL: http://localhost:8000
+        run: npm run build
+
+  # ─────────────────────────────────────
+  # 4) Docker Compose 起動チェック
+  # ─────────────────────────────────────
+  docker-build:
+    name: "Docker Build"
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build all Docker images
+        run: docker compose -f docker-compose.dev.yml build
+
+      - name: Start services
+        run: docker compose -f docker-compose.dev.yml up -d
+
+      - name: Wait for services to be ready
+        run: |
+          echo "Waiting for services..."
+          sleep 15
+          docker compose -f docker-compose.dev.yml ps
+
+      - name: Check API health
+        run: |
+          curl --retry 5 --retry-delay 3 --retry-connrefused \
+            http://localhost:8000/health
+
+      - name: Cleanup
+        if: always()
+        run: docker compose -f docker-compose.dev.yml down -v
